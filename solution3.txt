@@ -1,0 +1,260 @@
+clear; clc;
+
+%% ================= Basic Parameters =================
+teams = {
+    'Atlanta Dream','Georgia'
+    'Chicago Sky','Illinois'
+    'Connecticut Sun','Connecticut'
+    'Indiana Fever','Indiana'
+    'New York Liberty','Newyork'
+    'Washington Mystics','Districtofcolumbia'
+    'Dallas Wings','Texas'
+    'Las Vegas Aces','Nevada'
+    'Los Angeles Sparks','California'
+    'Minnesota Lynx','Minnesota'
+    'Phoenix Mercury','Arizona'
+    'Seattle Storm','Washington'
+};
+
+year = 2025;
+cap_2024_base = 1463200;
+cap_min_ratio = 0.837;
+growth_rate = 1.03;
+
+% Number of teams before expansion
+original_team_count = size(teams,1);
+% User input: Number of teams after league expansion
+expanded_team_count = input('Enter the number of teams after league expansion: ');
+% Input validation: Expanded number must be greater than original
+while expanded_team_count <= original_team_count || ~isnumeric(expanded_team_count)
+    fprintf('Invalid input! Number of teams after expansion must be numeric and greater than original count %d. Please re-enter.\n', original_team_count);
+    expanded_team_count = input('Enter the number of teams after league expansion: ');
+end
+
+% Calculate expansion scale factor
+scale_factor = expanded_team_count / original_team_count;
+fprintf('Team expansion scale factor: %.4f (%d teams → %d teams)\n', scale_factor, original_team_count, expanded_team_count);
+
+% Calculate original year salary cap, then adjust by expansion factor
+growth_multiplier = growth_rate^(year - 2024);
+cap_current_base = cap_2024_base * growth_multiplier;
+cap_current = cap_current_base * 1.128;
+cap_min_current = cap_current * cap_min_ratio;
+
+fprintf('Post-expansion %d salary cap: %.2f USD\n', year, cap_current);
+fprintf('Post-expansion %d minimum salary: %.2f USD\n', year, cap_min_current);
+
+%% ================= Read and Clean Player Data =================
+filename = 'Constraints and Objective Function.xlsx';
+if exist(filename, 'file') ~= 2
+    error('File %s not found. Please verify filename or path.', filename);
+end
+
+T = readtable(filename);
+n = height(T);
+
+% Clean salary data
+salary_cell = T.Salary2024;
+salary_original = zeros(n, 1);
+for i = 1:n
+    if iscell(salary_cell)
+        raw = salary_cell{i};
+    else
+        raw = salary_cell(i);
+    end
+    if iscell(raw)
+        str = raw{1};
+    elseif isnumeric(raw)
+        salary_original(i) = raw;
+        continue;
+    else
+        str = string(raw);
+    end
+    str_clean = regexprep(str, '[\$,\s]', '');
+    val = str2double(str_clean);
+    if isnan(val)
+        salary_original(i) = 0;
+    else
+        salary_original(i) = val;
+    end
+end
+
+% Adjust player salaries by expansion scale factor
+salary_new = salary_original * scale_factor;
+
+sign   = T.Signing2024;
+pos    = T.Position;
+team24 = T.Team2024;
+state24 = T.Team_State;
+names  = T.Name;
+
+% Identify rookies (N1-N24)
+is_rookie = false(n, 1);
+for i = 1:n
+    if startsWith(names{i}, 'N')
+        num = str2double(strrep(names{i}, 'N', ''));
+        if ~isnan(num) && num >= 1 && num <= 24
+            is_rookie(i) = true;
+        end
+    end
+end
+
+%% ================= Initialize Result Storage =================
+result_all = cell(size(teams,1), 19);
+
+%% ================= Team-by-Team Optimization Loop =================
+for t = 1:size(teams,1)
+    team_name  = teams{t,1};
+    team_state = teams{t,2};
+    fprintf('Optimizing team: %s ...\n', team_name);
+
+    % Build eligible player pool
+    is_common_tradable = ismember(sign, {'UFA','RFA','Rookie','Reserved','Hardship','--'});
+    is_my_mandatory = (ismember(sign, {'Core','SuspCE'}) & strcmp(team24, team_name));
+    I = find(is_common_tradable | is_my_mandatory);
+    m = length(I);
+    
+    if m < 12
+        warning('Team %s has insufficient eligible players (%d), skipping optimization.', team_name, m);
+        continue;
+    end
+    
+    % Objective function (maximize commercial value)
+    target_col = strcat(team_state, '_CommercialValueScore');
+    if ~ismember(target_col, T.Properties.VariableNames)
+        warning('Column %s not found, skipping team %s', target_col, team_name);
+        continue;
+    end
+    value_team = T.(target_col);
+    f = -value_team(I);
+    intcon = 1:m;
+
+    % Build hard constraints
+    A = []; b = [];
+    Aeq = []; beq = [];
+
+    % P1.1 Roster size fixed at 12
+    Aeq = [Aeq; ones(1,m)];
+    beq = [beq; 12];
+
+    % P1.2 Salary cap constraints using adjusted salaries
+    A = [A; salary_new(I)'];
+    b = [b; cap_current];
+    A = [A; -salary_new(I)'];
+    b = [b; -cap_min_current];
+
+    % P1.3 Mandatory retention of Core/SuspCE players
+    my_mandatory_indices_in_T = find(is_my_mandatory);
+    for k = 1:length(my_mandatory_indices_in_T)
+        glob_idx = my_mandatory_indices_in_T(k);
+        loc_idx = find(I == glob_idx);
+        if ~isempty(loc_idx)
+            row = zeros(1,m);
+            row(loc_idx) = 1;
+            Aeq = [Aeq; row];
+            beq = [beq; 1];
+        end
+    end
+
+    % P1.4 Maximum 2 rookies
+    rookie_in_I = is_rookie(I);
+    if sum(rookie_in_I) > 0
+        row_rookie = double(rookie_in_I);
+        A = [A; row_rookie'];
+        b = [b; 2];
+    end
+
+    % Build soft constraints
+    A_p2 = []; b_p2 = [];
+
+    % P2.1 Maximum 2 replacements from rookies/out-of-contract players
+    is_rookie_or_non_contract = is_rookie | ismember(sign, {'UFA','RFA','Reserved','Hardship','--'});
+    current_target_pool = find(strcmp(team24, team_name) & is_rookie_or_non_contract);
+    N_pool = length(current_target_pool);
+    if N_pool > 0
+        [~, loc_in_I] = intersect(I, current_target_pool);
+        if ~isempty(loc_in_I)
+            row = zeros(1,m);
+            row(loc_in_I) = 1;
+            A_p2 = [A_p2; -row];
+            b_p2 = [b_p2; -(N_pool - 2)];
+        end
+    end
+
+    % P2.2 Position balance constraints
+    isG = double(contains(pos(I), 'G'));
+    isF = double(contains(pos(I), 'F'));
+    isC = double(contains(pos(I), 'C'));
+    A_p2 = [A_p2; -isG'; isG'];
+    b_p2 = [b_p2; -3; 5];
+    A_p2 = [A_p2; -isF'; isF'];
+    b_p2 = [b_p2; -3; 5];
+    A_p2 = [A_p2; -isC'; isC'];
+    b_p2 = [b_p2; -2; 4];
+
+    % Integer linear programming solution
+    lb = zeros(m,1);
+    ub = ones(m,1);
+    options = optimoptions('intlinprog','Display','off');
+
+    % First attempt with all constraints
+    fprintf('  Attempting to satisfy all hard + soft constraints...\n');
+    [x, ~, exitflag] = intlinprog(f, intcon, [A; A_p2], [b; b_p2], Aeq, beq, lb, ub, options);
+
+    % Constraint relaxation: hard constraints only
+    if exitflag <= 0
+        warning('  No feasible solution with all constraints, relaxing to hard constraints only');
+        [x, ~, exitflag] = intlinprog(f, intcon, A, b, Aeq, beq, lb, ub, options);
+        if exitflag <= 0
+            warning('  No feasible solution with hard constraints either, no valid roster for this team');
+            x = zeros(m,1);
+        end
+    else
+        fprintf('  Successfully found optimal roster satisfying all constraints\n');
+    end
+
+    % Calculate and store results
+    if exitflag > 0
+        chosen_indices = I(x > 0.5);
+        
+        current_roster_2024 = find(strcmp(team24, team_name));
+        if ismember(target_col, T.Properties.VariableNames)
+            val24 = sum(T.(target_col)(current_roster_2024));
+        else
+            val24 = 0;
+        end
+        
+        val25 = sum(value_team(chosen_indices));
+        tot_sal_new = sum(salary_new(chosen_indices));
+        
+        result_all{t,1} = team_name;
+        result_all{t,2} = val24;
+        result_all{t,3} = val25;
+        result_all{t,4} = val25 - val24;
+        result_all{t,5} = tot_sal_new;
+        
+        for k = 1:14
+            col_idx = 5 + k;
+            if k <= length(chosen_indices)
+                result_all{t,col_idx} = names{chosen_indices(k)};
+            else
+                result_all{t,col_idx} = '';
+            end
+        end
+    else
+        result_all{t,1} = team_name;
+        result_all{t,2} = 0;
+        result_all{t,3} = NaN;
+        result_all{t,4} = NaN;
+        result_all{t,5} = NaN;
+    end
+end
+
+%% ================= Write Results to Excel =================
+varNames = [
+    {'Team','Value2024','Value2025','ValueDiff','TotalSalary_New'}, ...
+    arrayfun(@(x)sprintf('Player%d',x),1:14,'UniformOutput',false)
+];
+result_table = cell2table(result_all,'VariableNames',varNames);
+outfile = 'Question3_League_Expansion_12.8%+13Teams.xlsx';
+writetable(result_table, outfile);

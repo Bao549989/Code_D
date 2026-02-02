@@ -1,0 +1,281 @@
+clear; clc;
+
+%% ================= Basic Parameters =================
+teams = {
+    'Atlanta Dream','Georgia'
+    'Chicago Sky','Illinois'
+    'Connecticut Sun','Connecticut'
+    'Indiana Fever','Indiana'
+    'New York Liberty','New York'          % Correction: Newyork → New York
+    'Washington Mystics','District of Columbia'  % Correction: Districtofcolumbia → District of Columbia
+    'Dallas Wings','Texas'
+    'Las Vegas Aces','Nevada'
+    'Los Angeles Sparks','California'
+    'Minnesota Lynx','Minnesota'
+    'Phoenix Mercury','Arizona'
+    'Seattle Storm','Washington'
+};
+
+year = 2025;
+% Mode switch: true = rebuild mode (minimize age), false = championship mode (maximize WS)
+is_rebuild = false;  
+
+% Salary parameters
+cap_2024_base = 1463200;
+cap_min_ratio = 0.837;
+growth_rate = 1.03;
+growth_multiplier = growth_rate^(year - 2024);
+cap_current = cap_2024_base * growth_multiplier;
+cap_min_current = cap_current * cap_min_ratio;
+
+% Mode indicator
+if is_rebuild
+    fprintf('=== %d WNBA Rebuild Roster Optimization Parameters ===\n', year);
+else
+    fprintf('=== %d WNBA Championship Roster Optimization Parameters ===\n', year);
+end
+fprintf('Salary cap: %.2f USD\n', cap_current);
+fprintf('Minimum salary requirement: %.2f USD\n', cap_min_current);
+
+%% ================= Read Data =================
+filename = 'Constraints and Objective Function.xlsx';
+if exist(filename, 'file') ~= 2
+    error('File %s not found. Please verify filename or path.', filename);
+end
+
+T = readtable(filename);
+n = height(T);
+
+% -------- 1. Convert salary data --------
+salary_cell = T.Salary2024;
+salary = zeros(n, 1);
+for i = 1:n
+    raw = T.Salary2024(i);
+    if iscell(raw)
+        str = char(raw{1});
+    elseif isnumeric(raw)
+        salary(i) = raw;
+        continue;
+    else
+        str = char(raw);
+    end
+    str_clean = regexprep(str, '[\$,\s\-]', '');
+    val = str2double(str_clean);
+    if isnan(val) || val <= 0
+        val = 50000; % WNBA minimum salary fallback
+    end
+    salary(i) = val;
+end
+
+% -------- 2. Extract key columns --------
+sign_2024   = T.Signing2024;    % Contract status
+pos         = T.Position;       % Position
+team24      = T.Team2024;       % 2024 team
+state24     = T.Team_State;     % Team state
+names       = T.Name;           % Player name
+ws_values   = T.WS;             % Win Shares
+age_2024    = T.Age2024;        % 2024 Age
+age_current = age_2024 + (year - 2024);  % Current year age
+
+%% ================= Initialize Result Storage =================
+if is_rebuild
+    result_all = cell(size(teams,1), 19);
+    varNames = [
+        {'Team','AvgAge2024','AvgAge2025','AgeDiff','TotalSalary'}, ...
+        arrayfun(@(x)sprintf('Player%d',x),1:14,'UniformOutput',false)
+    ];
+else
+    result_all = cell(size(teams,1), 19);
+    varNames = [
+        {'Team','WS2024','WS2025','WSDiff','TotalSalary'}, ...
+        arrayfun(@(x)sprintf('Player%d',x),1:14,'UniformOutput',false)
+    ];
+end
+
+%% ================= Main Loop (Team-by-Team Optimization) =================
+for t = 1:size(teams,1)
+    team_name  = teams{t,1};
+    team_state = teams{t,2};
+    fprintf('\n====================\n');
+    fprintf('Optimizing team: %s \n', team_name);
+    fprintf('Matching state: %s \n', team_state);
+
+    % --- 1. Define eligible player pool I for this team ---
+    is_common_tradable = ismember(sign_2024, {'UFA','RFA','Rookie','Reserved','Hardship','--'});
+    is_my_mandatory = (ismember(sign_2024, {'Core','SuspCE'}) & strcmp(team24, team_name));
+    I = find(is_common_tradable | is_my_mandatory);
+    m = length(I);
+    
+    if m < 12
+        warning('Team %s has insufficient eligible players (%d), skipping optimization.', team_name, m);
+        result_all{t,1} = team_name;
+        result_all{t,2:5} = {0, NaN, NaN, 0};
+        result_all{t,6:19} = repmat('',1,14);
+        continue;
+    end
+    
+    % --- 2. Calculate baseline metrics (mode-specific) ---
+    current_roster_2024 = find(strcmp(team24, team_name));
+    if is_rebuild
+        age_2024_roster = age_current(current_roster_2024);
+        avg_age_2024 = mean(age_2024_roster);
+        fprintf('  Original 2024 roster average age: %.2f years\n', avg_age_2024);
+        
+        f = age_current(I);
+    else
+        ws_2024 = sum(ws_values(current_roster_2024));
+        fprintf('  Original 2024 roster WS sum: %.2f\n', ws_2024);
+        
+        f = -ws_values(I);
+    end
+    intcon = 1:m;
+
+    % --- 3. Build constraints (priority tiers) ---
+    A = []; b = [];
+    Aeq = []; beq = [];
+
+    % ================= Priority 1 Constraints (Hard Constraints) =================
+    Aeq = [Aeq; ones(1,m)];
+    beq = [beq; 12];
+    
+    A = [A; salary(I)'];
+    b = [b; cap_current];
+    A = [A; -salary(I)'];
+    b = [b; -cap_min_current];
+    
+    my_mandatory_indices_in_T = find(is_my_mandatory);
+    for k = 1:length(my_mandatory_indices_in_T)
+        glob_idx = my_mandatory_indices_in_T(k);
+        loc_idx = find(I == glob_idx);
+        if ~isempty(loc_idx)
+            row = zeros(1,m);
+            row(loc_idx) = 1;
+            Aeq = [Aeq; row];
+            beq = [beq; 1];
+        end
+    end
+
+    % ================= Priority 2 Constraints (Roster Balance) =================
+    A_p2 = []; b_p2 = [];
+    current_team_indices = find(strcmp(team24, team_name));
+    [~, loc_indices_current] = intersect(I, current_team_indices);
+    if ~isempty(loc_indices_current)
+        row = zeros(1,m);
+        row(loc_indices_current) = 1;
+        A_p2 = [A_p2; -row];
+        b_p2 = [b_p2; -8];
+    end
+
+    isG = double(contains(pos(I), 'G'));
+    isF = double(contains(pos(I), 'F'));
+    isC = double(contains(pos(I), 'C'));
+    A_p2 = [A_p2; -isG'; isG'];  b_p2 = [b_p2; -3; 5];
+    A_p2 = [A_p2; -isF'; isF'];  b_p2 = [b_p2; -3; 5];
+    A_p2 = [A_p2; -isC'; isC'];  b_p2 = [b_p2; -2; 4];
+
+    % ================= Priority 3 Constraints (Mode-Specific) =================
+    A_p3 = []; b_p3 = [];
+    if is_rebuild
+        [~, loc_indices_current] = intersect(I, current_team_indices);
+        loc_indices_replace = setdiff(1:m, loc_indices_current);
+        
+        if ~isempty(loc_indices_replace)
+            for idx = loc_indices_replace
+                row = zeros(1,m);
+                row(idx) = age_current(I(idx));
+                A_p3 = [A_p3; row];
+                b_p3 = [b_p3; 24];
+            end
+        end
+        fprintf('  Added rebuild constraints: replacement player age ≤ 24 years\n');
+    else
+        row_ws = ws_values(I)';
+        A_p3 = [A_p3; -row_ws];
+        b_p3 = [b_p3; -ws_2024];
+    end
+
+    % --- 4. Layered solving (priority: P1 > P2 > P3) ---
+    lb = zeros(m,1);
+    ub = ones(m,1);
+    options = optimoptions('intlinprog','Display','off');
+    exitflag = -1;
+    x = [];
+
+    fprintf('  Attempting to satisfy all constraints (P1+P2+P3)...\n');
+    [x, ~, exitflag] = intlinprog(f, intcon, [A; A_p2; A_p3], [b; b_p2; b_p3], Aeq, beq, lb, ub, options);
+    
+    if exitflag <= 0
+        warning('  Cannot satisfy Priority 3 constraints, downgrading to P1+P2...');
+        [x, ~, exitflag] = intlinprog(f, intcon, [A; A_p2], [b; b_p2], Aeq, beq, lb, ub, options);
+    end
+    
+    if exitflag <= 0
+        warning('  Cannot satisfy Priority 2 constraints, downgrading to P1 only...');
+        [x, ~, exitflag] = intlinprog(f, intcon, A, b, Aeq, beq, lb, ub, options);
+    end
+
+    % --- 5. Process results (mode-specific) ---
+    if exitflag > 0
+        x = round(x);
+        chosen_indices = I(x > 0.5);
+        tot_sal = sum(salary(chosen_indices));
+        
+        if is_rebuild
+            age_2025_roster = age_current(chosen_indices);
+            avg_age_2025 = mean(age_2025_roster);
+            age_diff = avg_age_2025 - avg_age_2024;
+            
+            result_all{t,1} = team_name;
+            result_all{t,2} = avg_age_2024;
+            result_all{t,3} = avg_age_2025;
+            result_all{t,4} = age_diff;
+            result_all{t,5} = tot_sal;
+            
+            fprintf('  Optimization successful! 2025 average age: %.2f years (change: %.2f)\n', avg_age_2025, age_diff);
+        else
+            ws_2025 = sum(ws_values(chosen_indices));
+            ws_diff = ws_2025 - ws_2024;
+            
+            result_all{t,1} = team_name;
+            result_all{t,2} = ws_2024;
+            result_all{t,3} = ws_2025;
+            result_all{t,4} = ws_diff;
+            result_all{t,5} = tot_sal;
+            
+            fprintf('  Optimization successful! 2025 WS sum: %.2f (improvement: %.2f)\n', ws_2025, ws_diff);
+        end
+        
+        for k = 1:14
+            col_idx = 5 + k;
+            if k <= length(chosen_indices)
+                result_all{t,col_idx} = names{chosen_indices(k)};
+            else
+                result_all{t,col_idx} = '';
+            end
+        end
+    else
+        warning('  Team %s has no feasible solution!', team_name);
+        result_all{t,1} = team_name;
+        if is_rebuild
+            result_all{t,2} = avg_age_2024;
+        else
+            result_all{t,2} = ws_2024;
+        end
+        result_all{t,3} = NaN;
+        result_all{t,4} = NaN;
+        result_all{t,5} = 0;
+        result_all{t,6:19} = repmat('',1,14);
+    end
+end
+
+%% ================= Output to Excel =================
+assert(length(varNames) == size(result_all,2), 'Number of column names does not match data columns');
+
+result_table = cell2table(result_all,'VariableNames',varNames);
+if is_rebuild
+    outfile = sprintf('WNBA_%d_Reconstruct_Optimization_Result.xlsx', year);
+else
+    outfile = sprintf('WNBA_%d_Championship_Optimization_Result.xlsx', year);
+end
+writetable(result_table, outfile);
+fprintf('\nOptimization completed! Results saved to: %s\n', outfile);
